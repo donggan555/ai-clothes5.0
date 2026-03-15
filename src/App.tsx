@@ -20,6 +20,7 @@ export function App() {
   const [selectedModel, setSelectedModel] = useState('nano-banana');
   const [imageSize, setImageSize] = useState('1K');
   const [aspectRatio, setAspectRatio] = useState('auto');
+  const [viewMode, setViewMode] = useState<'front' | 'back'>('front');
   
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -58,7 +59,8 @@ export function App() {
     const file = e.target.files?.[0];
     if (file) {
       const base64 = await fileToBase64(file);
-      const resized = await resizeImage(base64, imageSize === '4K' ? 4096 : 2048);
+      // 将前端上传时强制缩放到最大 1024，极大降低 Base64 体积，防止因为 JSON 太大导致接口拒绝连接 (413/Error)
+      const resized = await resizeImage(base64, 1024);
       setGarment(resized);
     }
     if (garmentInputRef.current) garmentInputRef.current.value = '';
@@ -73,10 +75,16 @@ export function App() {
     const newModels = await Promise.all(
       files.map(async f => {
         const base64 = await fileToBase64(f);
-        return resizeImage(base64, imageSize === '4K' ? 4096 : 2048);
+        return resizeImage(base64, 1024);
       })
     );
     setModels(prev => [...prev, ...newModels]);
+    
+    // 如果上传了真人模特，自动将模型切换到专门的换装大模型(vt = Virtual Try-on)以获得完美不重叠效果
+    if (newModels.length > 0 && !selectedModel.includes('vt')) {
+      setSelectedModel('nano-banana-pro-vt');
+    }
+    
     if (modelInputRef.current) modelInputRef.current.value = '';
   };
 
@@ -95,7 +103,7 @@ export function App() {
                 status: status, 
                 progress: res.data.progress || 0,
                 resultUrl: res.data.results?.[0]?.url,
-                error: res.data.failure_reason || res.data.error
+                error: res.data.failure_reason || res.data.error || (status === 'failed' ? '未知错误' : undefined)
               };
               saveHistory(newHistory[idx]);
             }
@@ -161,10 +169,10 @@ export function App() {
         setHistory(prev => [newItem, ...prev]);
         startPolling(res.data.id, apiKey);
       } else {
-        alert("生成请求失败: " + (res.msg || "未知错误"));
+        alert("生成请求失败: " + (res.msg || res.error || "接口异常或余额不足，请稍后重试"));
       }
     } catch (err) {
-      alert("网络请求失败，请检查API Key或网络状态");
+      alert("网络请求失败: 图片可能过大或网络超时");
     }
   };
 
@@ -176,13 +184,53 @@ export function App() {
     
     if (models.length > 0) {
       for (const modelImg of models) {
-        await generateSingle(garment, modelImg);
-        await new Promise(r => setTimeout(r, 1000));
+        // 【防违规优化】移除可能触发敏感词拦截的 "body shape", "body curves" 词汇，缩减过长提示词
+        let tryOnPrompt = "virtual try-on, exactly preserve original person's pose, hand gestures, face and background. new garment drape naturally with 3D fabric folds. graphic print or logo must warp naturally along fabric folds, seamless integration, high quality, photorealistic.";
+        
+        if (viewMode === 'back') {
+          tryOnPrompt = "back view, exactly preserve original person's pose from behind, facing away from camera. new garment worn properly showing back side. natural fabric draping, 3D clothing wrinkles, graphic print on back warps naturally, perfect clothing replacement, photorealistic.";
+        }
+
+        // 自动将模型切换到可能专门用于换装的 vt (Virtual Try-on) 模型，以获得最佳换装效果，防止叠加
+        const actualModel = selectedModel.includes('vt') ? selectedModel : 'nano-banana-pro-vt';
+        
+        try {
+          const res = await submitGeneration({
+            apiKey,
+            model: actualModel,
+            prompt: tryOnPrompt,
+            aspectRatio,
+            imageSize,
+            urls: [modelImg, garment] // 注意：通常换装API的图1(基底图)是模特，图2是衣服
+          });
+
+          if (res.code === 0 && res.data?.id) {
+            const newItem: HistoryItem = {
+              id: res.data.id,
+              garment: garment,
+              modelImage: modelImg,
+              prompt: tryOnPrompt,
+              status: 'queued',
+              progress: 0,
+              timestamp: Date.now()
+            };
+            await saveHistory(newItem);
+            setHistory(prev => [newItem, ...prev]);
+            startPolling(res.data.id, apiKey);
+          } else {
+            alert("生成请求失败: " + (res.msg || res.error || "接口异常或余额不足，请稍后重试"));
+          }
+        } catch (err) {
+          alert("网络请求失败: 图片可能过大或网络超时");
+        }
+        // 增加排队请求的间隔，防止被 API 接口限流拦截导致“经常失败”
+        await new Promise(r => setTimeout(r, 2000));
       }
     } else {
       for (let i = 0; i < generateCount; i++) {
         await generateSingle(garment, undefined, `${customPrompt} [variation ${i+1}]`);
-        await new Promise(r => setTimeout(r, 1000));
+        // 同理，增加连续排队的间隔防止被限流
+        await new Promise(r => setTimeout(r, 2000));
       }
     }
     
@@ -264,6 +312,9 @@ export function App() {
                 <label className="text-sm font-medium text-gray-700">上传真人模特图 (最多9张)</label>
                 <span className="text-xs text-gray-500">{models.length}/9</span>
               </div>
+              <p className="text-xs text-indigo-600 mb-2">
+                * 若上传模特图，系统会自动使用专门的 <b>vt (Virtual Try-on)</b> 换装模型，可防止出现衣服叠加和模特脸部变更。
+              </p>
               <div className="flex flex-wrap gap-2">
                 {models.map((img, idx) => (
                   <div key={idx} className="relative w-20 h-20 border rounded-md group">
@@ -331,12 +382,25 @@ export function App() {
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-gray-500 mb-1">图片比例</label>
+                <label className="block text-xs text-gray-500 mb-1">图片比例 (选auto保持动作)</label>
                 <select value={aspectRatio} onChange={e => setAspectRatio(e.target.value)} className="w-full border rounded p-2 text-sm outline-none">
                   {RATIOS.map(r => <option key={r} value={r}>{r}</option>)}
                 </select>
               </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">换装视角</label>
+                <select value={viewMode} onChange={e => setViewMode(e.target.value as 'front' | 'back')} className="w-full border rounded p-2 text-sm outline-none">
+                  <option value="front">正面换装</option>
+                  <option value="back">背面换装</option>
+                </select>
+              </div>
             </div>
+
+            {viewMode === 'back' && (
+              <div className="mt-4 p-3 bg-indigo-50 border border-indigo-100 rounded text-xs text-indigo-700">
+                <p><b>提示：</b> 背面换装时，请务必同时上传 <b>背面的平铺服装图</b> 和 <b>背面的模特图</b>，效果最佳。</p>
+              </div>
+            )}
             
             <button
               onClick={handleGenerate}

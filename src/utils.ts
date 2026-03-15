@@ -14,7 +14,7 @@ export function fileToBase64(file: File): Promise<string> {
   });
 }
 
-export function resizeImage(base64Str: string, maxSize: number = 2048): Promise<string> {
+export function resizeImage(base64Str: string, maxSize: number = 1024): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.src = base64Str;
@@ -36,7 +36,7 @@ export function resizeImage(base64Str: string, maxSize: number = 2048): Promise<
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', 0.9));
+        resolve(canvas.toDataURL('image/jpeg', 0.85)); // 降低质量到 0.85，防止 Base64 体积过大导致 API 请求失败
       } else {
         resolve(base64Str);
       }
